@@ -18,7 +18,18 @@ static int led_chr_access(uint16_t conn_handle, uint16_t attr_handle,
 static int sound_meter_access(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg);
 
-static uint16_t chr_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+typedef struct {
+    bool heart_rate_used;
+    bool heart_rate_indicate_enabled;
+    bool sound_meter_used;
+    bool sound_meter_used_indicate_enabled;
+    uint16_t conn_handle;
+    
+} hr_sub_t;
+
+static hr_sub_t s_hr_subs[CONFIG_BT_NIMBLE_MAX_CONNECTIONS];
+
 
 /* Private variables */
 /* Heart rate service */
@@ -34,7 +45,6 @@ static const ble_uuid16_t heart_rate_chr_uuid = BLE_UUID16_INIT(0x2A37);
 
 // heart_rate_chr_conn_handleは接続ハンドル。BLE_HS_CONN_HANDLE_NONEは接続なし
 static bool heart_rate_chr_conn_handle_inited = false;
-static bool heart_rate_ind_status = false;
 
 /* Automation IO service */
 static const ble_uuid16_t auto_io_svc_uuid = BLE_UUID16_INIT(0x1815);
@@ -48,7 +58,6 @@ static const ble_uuid128_t sound_meter_svc_uuid =
 static uint8_t sound_level_chr_val[2]={0};
 static uint16_t sound_level_chr_val_handle;
 static bool sound_level_chr_conn_handle_inited = false;
-static bool sound_level_ind_status = false;
 static const ble_uuid128_t sound_level_chr_uuid = 
     BLE_UUID128_INIT(0x2a, 0xe3, 0x26, 0x73, 0x06, 0x0e, 0x93, 0xa3, 0x3b, 0x41,0x4c, 0x69, 0x92, 0x65, 0x96, 0xf0);
 
@@ -100,6 +109,50 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
 };
 
 /* Private functions */
+static void clear_sub_by_conn(uint16_t conn_handle, uint16_t attr_handle){
+    for(int i=0; i<CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++){
+        if((s_hr_subs[i].heart_rate_used||s_hr_subs[i].sound_meter_used) && s_hr_subs[i].conn_handle == conn_handle){
+            if(attr_handle==heart_rate_chr_val_handle){
+                s_hr_subs[i].heart_rate_used = false;
+                s_hr_subs[i].heart_rate_indicate_enabled = false;
+            } else if(attr_handle==sound_level_chr_val_handle){
+                s_hr_subs[i].sound_meter_used = false;
+                s_hr_subs[i].sound_meter_used_indicate_enabled = false;
+            }
+        }
+    }
+}
+
+static void set_sub_by_conn(uint16_t conn_handle, uint16_t attr_handle){
+    for(int i=0; i<CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++){
+        if(s_hr_subs[i].conn_handle==BLE_HS_CONN_HANDLE_NONE || s_hr_subs[i].conn_handle==conn_handle){
+            s_hr_subs[i].conn_handle = conn_handle;
+            if(attr_handle==heart_rate_chr_val_handle){
+                s_hr_subs[i].heart_rate_used = true;
+                s_hr_subs[i].heart_rate_indicate_enabled = true;
+            } else if(attr_handle==sound_level_chr_val_handle){
+                s_hr_subs[i].sound_meter_used = true;
+                s_hr_subs[i].sound_meter_used_indicate_enabled = true;
+            }
+            return;
+        }
+    }
+}
+
+static void update_hr_subscribe(const struct ble_gap_event *event){
+    uint16_t conn_handle = event->subscribe.conn_handle;
+    uint16_t attr_handle = event->subscribe.attr_handle;
+
+    if((attr_handle != heart_rate_chr_val_handle) && (attr_handle != sound_level_chr_val_handle) ){
+        return;
+    }
+    if(!event->subscribe.cur_indicate){
+        clear_sub_by_conn(conn_handle, attr_handle);
+    } else {
+        set_sub_by_conn(conn_handle, attr_handle);
+    }
+}
+
 static int heart_rate_chr_access(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg) {
     /* Local variables */
@@ -232,18 +285,20 @@ error:
 
 /* Public functions */
 void send_heart_rate_indication(void) {
-    if (heart_rate_ind_status && heart_rate_chr_conn_handle_inited) {
-        // characteristic indicationを送信する
-        ble_gatts_indicate(chr_conn_handle,
-                           heart_rate_chr_val_handle);
-        ESP_LOGI(TAG, "heart rate indication sent!");
+    for (int i=0; i<CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++){
+        if(s_hr_subs[i].heart_rate_used && s_hr_subs[i].heart_rate_indicate_enabled){
+            ble_gatts_indicate(s_hr_subs[i].conn_handle, heart_rate_chr_val_handle);
+            ESP_LOGI(TAG, "heart rate indication sent!");
+        }
     }
 }
 
 void send_sound_level_indication(void){
-    if(sound_level_ind_status && sound_level_chr_conn_handle_inited){
-        ble_gatts_indicate(chr_conn_handle, sound_level_chr_val_handle);
-        ESP_LOGI(TAG, "sound level indication sent!");
+    for (int i=0; i<CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++){
+        if(s_hr_subs[i].sound_meter_used && s_hr_subs[i].sound_meter_used_indicate_enabled){
+            ble_gatts_indicate(s_hr_subs[i].conn_handle, sound_level_chr_val_handle);
+            ESP_LOGI(TAG, "sound level indication sent!");
+        }
     }
 }
 
@@ -308,26 +363,18 @@ void gatt_svr_subscribe_cb(struct ble_gap_event *event) {
     /* Check attribute handle */
     if (event->subscribe.attr_handle == heart_rate_chr_val_handle) {
         /* Update heart rate subscription status */
-        chr_conn_handle = event->subscribe.conn_handle;
-        heart_rate_chr_conn_handle_inited = true;
-        heart_rate_ind_status = event->subscribe.cur_indicate;
+        update_hr_subscribe(event);
     } else if (event->subscribe.attr_handle == sound_level_chr_val_handle){
-        chr_conn_handle = event->subscribe.conn_handle;
-        sound_level_chr_conn_handle_inited = true;
-        sound_level_ind_status = true;
+        update_hr_subscribe(event);
     }
 }
 
-void gatt_svr_reset_heart_rate_subscription(void) {
-    chr_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-    heart_rate_chr_conn_handle_inited = false;
-    heart_rate_ind_status = false;
+void gatt_svr_reset_heart_rate_subscription(struct ble_gap_event *event) {
+    update_hr_subscribe(event);
 }
 
-void gatt_svr_reset_sound_meter_subscription(void){
-    chr_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-    sound_level_chr_conn_handle_inited = false;
-    sound_level_ind_status = false;
+void gatt_svr_reset_sound_meter_subscription(struct ble_gap_event *event){
+    update_hr_subscribe(event);
 }
 
 /*
@@ -337,6 +384,14 @@ void gatt_svr_reset_sound_meter_subscription(void){
  *      3. Add GATT services to server
  */
 int gatt_svc_init(void) {
+    for(int i=0; i<CONFIG_BT_NIMBLE_MAX_CONNECTIONS; i++){
+        s_hr_subs[i].heart_rate_used = false;
+        s_hr_subs[i].heart_rate_indicate_enabled = false;
+        s_hr_subs[i].sound_meter_used = false;
+        s_hr_subs[i].sound_meter_used_indicate_enabled = false;
+        s_hr_subs[i].conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+
     /* Local variables */
     int rc = 0;
 
